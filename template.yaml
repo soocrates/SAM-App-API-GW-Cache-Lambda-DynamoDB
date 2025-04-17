@@ -1,0 +1,158 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Stock Tracking System with Real-time Updates and Historical Data
+
+Globals:
+  Function:
+    Timeout: 10
+    MemorySize: 512
+    Tracing: Active
+    LoggingConfig:
+      LogFormat: JSON
+
+Resources:
+  # API GW Caching
+  CachedApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: Prod
+      CacheClusterEnabled: True
+      CacheClusterSize: "0.5"  # 0.5GB cache size
+      TracingEnabled: True  # Enables X-Ray tracing
+      MethodSettings:
+        - HttpMethod: "GET"
+          ResourcePath: "/stocks"
+          CacheDataEncrypted: True
+          CacheTtlInSeconds: 600  # Cache for 10 seconds for list of stocks
+          CachingEnabled: True
+          MetricsEnabled: True
+          LoggingLevel: INFO
+          DataTraceEnabled: True
+
+        - HttpMethod: "GET"
+          ResourcePath: "/stocks/{stockId}"
+          CachingEnabled: false
+          MetricsEnabled: True
+          LoggingLevel: INFO
+          DataTraceEnabled: True
+          
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/${CachedApi}"
+      RetentionInDays: 7
+
+  # DynamoDB Table for stock data (without Stream)
+  StockTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: StockTable
+      AttributeDefinitions:
+        - AttributeName: stockId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: stockId
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: expireAt
+        Enabled: true
+
+  # Main Stock API Handler
+  StockHandler:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: stock_api/
+      Handler: app.lambda_handler
+      Runtime: python3.12
+      Architectures:
+        - x86_64
+      Environment:
+        Variables:
+          STOCK_TABLE: !Ref StockTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref StockTable
+      Events:
+        GetStockData:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CachedApi
+            Path: /stocks
+            Method: GET
+        GetStockById:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CachedApi
+            Path: /stocks/{stockId}
+            Method: GET
+
+  # Cache Invalidator Function
+  CacheInvalidator:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: cache_invalidator/
+      Handler: app.lambda_handler
+      Runtime: python3.12
+      Architectures:
+        - x86_64
+      Environment:
+        Variables:
+          API_ID: !Ref CachedApi
+          STAGE_NAME: Prod
+      Policies:
+          # Add DynamoDB permissions
+        - DynamoDBCrudPolicy:
+            TableName: !Ref StockTable
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - apigateway:PATCH
+                - apigateway:GET
+              Resource: !Sub "arn:aws:apigateway:${AWS::Region}::/restapis/${CachedApi}/stages/Prod"
+      FunctionUrlConfig:
+        AuthType: NONE
+        Cors:
+          AllowOrigins:
+            - '*'
+          AllowMethods:
+            - GET
+          AllowHeaders:
+            - content-type
+          MaxAge: 300
+
+# Outputs:
+#   CachedApiEndpoint:
+#     Description: "API Gateway endpoint URL for Prod stage"
+#     Value: !Sub "https://${CachedApi}.execute-api.${AWS::Region}.amazonaws.com/Prod"
+    
+#   StockHandlerFunction:
+#     Description: "Stock Handler Lambda Function ARN"
+#     Value: !GetAtt StockHandler.Arn
+    
+#   CacheInvalidatorFunction:
+#     Description: "Cache Invalidator Lambda Function ARN"
+#     Value: !GetAtt CacheInvalidator.Arn
+    
+#   StockTableName:
+#     Description: "DynamoDB Table Name" 
+#     Value: !Ref StockTable
+    
+#   StockTableArn:
+#     Description: "DynamoDB Table ARN"
+#     Value: !GetAtt StockTable.Arn
+    
+#   CacheInvalidatorUrl:
+#     Description: "URL for the Cache Invalidator function"
+#     Value: !GetAtt CacheInvalidator.FunctionUrl
+    
+#   ApiGatewayId:
+#     Description: "API Gateway ID"
+#     Value: !Ref CachedApi
